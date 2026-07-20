@@ -90,9 +90,10 @@ def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
     A_p_t = A_p * loss_fraction
 
     T = A_p_t * f_ps                                        # tendon force, N
-    a = T / (0.85 * req.f_ck_MPa * req.b_f_m * 1000)         # stress-block depth, m
-    z = req.d_p_m - a / 2                                     # lever arm, m
-    R = theta_R * (T / 1000) * z                              # capacity, kN·m
+    a = T / (0.85 * req.f_ck_MPa * req.b_f_m )         # stress-block depth, mm
+    z = req.d_p_m - a / 2                                     # lever arm, mm
+   # N * mm -> kN * m: divide by 1e6 (1 kN.m = 1000 N * 1000 mm = 1e6 N.mm)
+    R = theta_R * (T * z_mm) / 1e6                       # kN·m
 
     g = R - E
     n_fail = int(np.sum(g < 0))
