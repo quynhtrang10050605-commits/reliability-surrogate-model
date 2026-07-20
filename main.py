@@ -1,3 +1,76 @@
+"""
+Structural Reliability Service
+================================
+FastAPI microservice that computes structural reliability (Pf, beta)
+via direct Monte Carlo simulation, using verified closed-form capacity
+and demand formulas.
+
+Endpoints:
+  POST /reliability - run direct Monte Carlo reliability analysis
+  GET  /health       - health check
+"""
+
+import numpy as np
+from scipy.stats import norm
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Optional
+
+app = FastAPI(
+    title="Structural Reliability Service",
+    description=(
+        "Physics-guided direct Monte Carlo reliability analysis. "
+        "Computes Pf(t) and beta(t) from verified capacity/demand formulas."
+    ),
+    version="2.0.0",
+)
+
+
+# --------------------------------------------------------------------------
+# Pydantic schemas
+# --------------------------------------------------------------------------
+
+class ReliabilityRequest(BaseModel):
+    N: int
+    timeStep_years: float
+
+    # Demand — from structural analysis (MIDAS/SAP2000), per load case
+    demand_dead_mean_kNm: float
+    demand_live_mean_kNm: float
+    demand_dead_cov: float
+    demand_live_cov: float
+
+    # Resistance — PC-girder flexure (AASHTO 5.6.3 / EN 6.1)
+    A_p_mean_mm2: float
+    A_p_cov: float
+    f_ps_mean_MPa: float
+    f_ps_cov: float
+    f_ck_MPa: float
+    b_f_m: float
+    d_p_m: float
+    theta_R_mean: float
+    theta_R_cov: float
+
+    # Corrosion — two-phase (fib Bulletin 34/59)
+    T_i_years: float
+    k_A: float
+
+
+class ReliabilityResponse(BaseModel):
+    timeStep_years: float
+    N: int
+    n_fail: int
+    Pf: float
+    beta: float
+    cov_Pf: Optional[float]
+    mean_capacity_kNm: float
+    mean_demand_kNm: float
+
+
+# --------------------------------------------------------------------------
+# Core Monte Carlo function
+# --------------------------------------------------------------------------
+
 def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
     rng = np.random.default_rng(seed=42)  # seeded — reproducible
 
@@ -15,12 +88,12 @@ def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
     loss_fraction = max(0.0, 1.0 - req.k_A * max(0.0, req.timeStep_years - req.T_i_years))
     loss_fraction = max(loss_fraction, 0.05)
     A_p_t = A_p * loss_fraction
-
+    
     # Convert geometry from meters to millimeters — f_ck (MPa = N/mm2) and
     # f_ps (MPa) are naturally in mm-based units, so everything must match.
     b_f_mm = req.b_f_m * 1000
     d_p_mm = req.d_p_m * 1000
-
+    
     T = A_p_t * f_ps                                   # tendon force, N (mm2 * MPa = N)
     a_mm = T / (0.85 * req.f_ck_MPa * b_f_mm)           # stress-block depth, mm
     z_mm = d_p_mm - a_mm / 2                             # lever arm, mm
@@ -44,3 +117,22 @@ def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
         mean_capacity_kNm=float(np.mean(R)),
         mean_demand_kNm=float(np.mean(E)),
     )
+
+
+# --------------------------------------------------------------------------
+# Endpoints
+# --------------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/reliability", response_model=ReliabilityResponse)
+def reliability_endpoint(req: ReliabilityRequest):
+    return run_reliability(req)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
