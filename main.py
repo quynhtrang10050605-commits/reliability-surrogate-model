@@ -1,59 +1,34 @@
-"""
-Structural Reliability Service
-================================
-FastAPI microservice that computes structural reliability (Pf, beta)
-via direct Monte Carlo simulation, using verified closed-form capacity
-and demand formulas.
-
-Endpoints:
-  POST /reliability - run direct Monte Carlo reliability analysis
-  GET  /health       - health check
-"""
-
 import numpy as np
 from scipy.stats import norm
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict
 
-app = FastAPI(
-    title="Structural Reliability Service",
-    description=(
-        "Physics-guided direct Monte Carlo reliability analysis. "
-        "Computes Pf(t) and beta(t) from verified capacity/demand formulas."
-    ),
-    version="2.0.0",
-)
+app = FastAPI(title="Structural Reliability Service", version="3.0.0")
 
 
-# --------------------------------------------------------------------------
-# Pydantic schemas
-# --------------------------------------------------------------------------
+class RandomVariableSpec(BaseModel):
+    dist: str       # "normal" | "lognormal" | "gumbel"
+    mean: float
+    cov: float
+
 
 class ReliabilityRequest(BaseModel):
     N: int
     timeStep_years: float
 
-    # Demand — from structural analysis (MIDAS/SAP2000), per load case
-    demand_dead_mean_kNm: float
-    demand_live_mean_kNm: float
-    demand_dead_cov: float
-    demand_live_cov: float
+    # ── Supplied by the Recipe Agent — the executable law, NOT hardcoded here ──
+    capacity_formula: str          # e.g. "A_s * (f_yk/1.15) * (d_mm - (A_s*(f_yk/1.15))/(2*0.85*f_ck*b_mm)) / 1e6"
+    demand_formula: str            # e.g. "B_D * demand_dead_mean_kNm + B_L * demand_live_mean_kNm"
+    corrosion_formula: Optional[str] = None   # e.g. "max(0.05, 1 - k_A*max(0, t-T_i))" — multiplies a named variable
 
-    # Resistance — PC-girder flexure (AASHTO 5.6.3 / EN 6.1)
-    A_p_mean_mm2: float
-    A_p_cov: float
-    f_ps_mean_MPa: float
-    f_ps_cov: float
-    f_ck_MPa: float
-    b_f_m: float
-    d_p_m: float
-    theta_R_mean: float
-    theta_R_cov: float
+    # ── Random variables — distribution model from Recipe Agent (JCSS/code) ──
+    variables: Dict[str, RandomVariableSpec]
 
-    # Corrosion — two-phase (fib Bulletin 34/59)
-    T_i_years: float
-    k_A: float
+    # ── Fixed, deterministic values — auto-mapped from IFC geometry + Excel ──
+    # (per-member values: b_mm, d_mm, f_ck, demand_dead_mean_kNm, ... — whatever
+    # the formula strings above reference by name)
+    fixed_params: Dict[str, float]
 
 
 class ReliabilityResponse(BaseModel):
@@ -67,39 +42,52 @@ class ReliabilityResponse(BaseModel):
     mean_demand_kNm: float
 
 
-# --------------------------------------------------------------------------
-# Core Monte Carlo function
-# --------------------------------------------------------------------------
+# ── Restricted namespace for eval — ONLY numpy math, no builtins, no I/O ──
+SAFE_GLOBALS = {
+    "__builtins__": {},
+    "np": np,
+    "max": np.maximum,   # vectorized max, so formulas can write max(0, x) on arrays
+    "min": np.minimum,
+}
+
+
+def sample_variable(spec: RandomVariableSpec, N: int, rng) -> np.ndarray:
+    if spec.dist == "normal":
+        return rng.normal(spec.mean, spec.mean * spec.cov, size=N)
+    if spec.dist == "lognormal":
+        return rng.lognormal(mean=np.log(spec.mean), sigma=spec.cov, size=N)
+    if spec.dist == "gumbel":
+        return rng.gumbel(loc=spec.mean, scale=spec.cov, size=N)
+    raise HTTPException(400, f"Unsupported distribution type: {spec.dist}")
+
+
+def safe_eval_formula(formula: str, namespace: dict):
+    try:
+        return eval(formula, SAFE_GLOBALS, namespace)
+    except Exception as e:
+        raise HTTPException(400, f"Error evaluating formula '{formula}': {e}")
+
 
 def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
-    rng = np.random.default_rng(seed=42)  # seeded — reproducible
+    rng = np.random.default_rng(seed=42)
 
-    # Demand — one uncertainty factor per load case (Turkstra combination)
-    B_D = rng.lognormal(mean=np.log(1.0), sigma=req.demand_dead_cov, size=req.N)
-    B_L = rng.gumbel(loc=1.0, scale=req.demand_live_cov, size=req.N)
-    E = B_D * req.demand_dead_mean_kNm + B_L * req.demand_live_mean_kNm
+    # 1. Sample every random variable according to the Recipe Agent's distribution model
+    sampled = {name: sample_variable(spec, req.N, rng) for name, spec in req.variables.items()}
 
-    # Resistance — PC-girder flexure (verified formula)
-    A_p = rng.normal(req.A_p_mean_mm2, req.A_p_mean_mm2 * req.A_p_cov, size=req.N)
-    f_ps = rng.lognormal(mean=np.log(req.f_ps_mean_MPa), sigma=req.f_ps_cov, size=req.N)
-    theta_R = rng.lognormal(mean=np.log(req.theta_R_mean), sigma=req.theta_R_cov, size=req.N)
+    # 2. Merge sampled arrays + fixed deterministic params + time step into ONE namespace
+    namespace = {**sampled, **req.fixed_params, "t": req.timeStep_years}
 
-    # Corrosion — two-phase degradation of tendon area
-    loss_fraction = max(0.0, 1.0 - req.k_A * max(0.0, req.timeStep_years - req.T_i_years))
-    loss_fraction = max(loss_fraction, 0.05)
-    A_p_t = A_p * loss_fraction
-    
-    # Convert geometry from meters to millimeters — f_ck (MPa = N/mm2) and
-    # f_ps (MPa) are naturally in mm-based units, so everything must match.
-    b_f_mm = req.b_f_m * 1000
-    d_p_mm = req.d_p_m * 1000
-    
-    T = A_p_t * f_ps                                   # tendon force, N (mm2 * MPa = N)
-    a_mm = T / (0.85 * req.f_ck_MPa * b_f_mm)           # stress-block depth, mm
-    z_mm = d_p_mm - a_mm / 2                             # lever arm, mm
+    # 3. Apply corrosion degradation, if the recipe includes one, to whichever
+    #    variable it targets (the formula itself decides — e.g. multiplies A_s)
+    if req.corrosion_formula:
+        namespace["degradation_factor"] = safe_eval_formula(req.corrosion_formula, namespace)
+    else:
+        namespace["degradation_factor"] = 1.0
 
-    # N * mm -> kN * m: divide by 1e6 (1 kN.m = 1000 N * 1000 mm = 1e6 N.mm)
-    R = theta_R * (T * z_mm) / 1e6                       # capacity, kN·m
+    # 4. Evaluate demand and capacity — BOTH formulas come from the Recipe Agent,
+    #    not from any code written in this service.
+    E = safe_eval_formula(req.demand_formula, namespace)
+    R = safe_eval_formula(req.capacity_formula, namespace)
 
     g = R - E
     n_fail = int(np.sum(g < 0))
@@ -108,20 +96,10 @@ def run_reliability(req: ReliabilityRequest) -> ReliabilityResponse:
     cov_Pf = float(np.sqrt((1 - Pf) / (Pf * req.N))) if Pf > 0 else None
 
     return ReliabilityResponse(
-        timeStep_years=req.timeStep_years,
-        N=req.N,
-        n_fail=n_fail,
-        Pf=Pf,
-        beta=beta,
-        cov_Pf=cov_Pf,
-        mean_capacity_kNm=float(np.mean(R)),
-        mean_demand_kNm=float(np.mean(E)),
+        timeStep_years=req.timeStep_years, N=req.N, n_fail=n_fail, Pf=Pf, beta=beta,
+        cov_Pf=cov_Pf, mean_capacity_kNm=float(np.mean(R)), mean_demand_kNm=float(np.mean(E)),
     )
 
-
-# --------------------------------------------------------------------------
-# Endpoints
-# --------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
